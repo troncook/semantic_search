@@ -1,0 +1,123 @@
+import os
+import faiss
+import sqlite3
+import pdfplumber
+import numpy as np
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+
+# === CONFIG ===
+PDF_DIR = './pdfs'
+DB_PATH = 'pdf_chunks.db'
+INDEX_PATH = 'faiss.index'
+CHUNK_SIZE = 300
+TOP_K = 5
+
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# === UTILS ===
+def extract_text_from_pdf(path):
+    text = ''
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            page_text = page.extract_text()
+            if page_text:
+                text += f"\n[Page {i+1}]\n{page_text}"
+    return text
+
+def chunk_text(text, max_length=CHUNK_SIZE):
+    paras = text.split('\n')
+    chunks = []
+    current = ''
+    for p in paras:
+        if len(current) + len(p) < max_length:
+            current += ' ' + p
+        else:
+            chunks.append(current.strip())
+            current = p
+    if current:
+        chunks.append(current.strip())
+    return chunks
+
+def initialize_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('DROP TABLE IF EXISTS chunks')
+    c.execute('''
+        CREATE TABLE chunks (
+            id INTEGER PRIMARY KEY,
+            file_name TEXT,
+            chunk_id INTEGER,
+            chunk_text TEXT
+        )
+    ''')
+    conn.commit()
+    return conn, c
+
+def build_index():
+    conn, c = initialize_db()
+    all_embeddings = []
+
+    print(f"🔍 Scanning PDFs in: {PDF_DIR}")
+    for filename in tqdm(os.listdir(PDF_DIR)):
+        if not filename.lower().endswith('.pdf'):
+            continue
+        path = os.path.join(PDF_DIR, filename)
+        try:
+            text = extract_text_from_pdf(path)
+            chunks = chunk_text(text)
+            embeddings = model.encode(chunks, convert_to_tensor=False)
+            all_embeddings.extend(embeddings)
+            for i, chunk in enumerate(chunks):
+                c.execute("INSERT INTO chunks (file_name, chunk_id, chunk_text) VALUES (?, ?, ?)", (filename, i, chunk))
+        except Exception as e:
+            print(f"❌ Failed to process {filename}: {e}")
+
+    conn.commit()
+    conn.close()
+
+    if all_embeddings:
+        dim = len(all_embeddings[0])
+        index = faiss.IndexFlatL2(dim)
+        index.add(np.array(all_embeddings))
+        faiss.write_index(index, INDEX_PATH)
+        print(f"✅ FAISS index saved to {INDEX_PATH}")
+    else:
+        print("⚠️ No valid PDF content found.")
+
+def search(query, top_k=TOP_K):
+    index = faiss.read_index(INDEX_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+
+    q_vec = model.encode([query], convert_to_tensor=False)
+    D, I = index.search(np.array(q_vec), top_k)
+
+    results = []
+    for idx in I[0]:
+        c.execute("SELECT file_name, chunk_id, chunk_text FROM chunks WHERE id=?", (idx + 1,))
+        row = c.fetchone()
+        if row:
+            results.append({
+                "file": row[0],
+                "chunk_id": row[1],
+                "text": row[2]
+            })
+    conn.close()
+    return results
+
+# === CLI INTERFACE ===
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--build', action='store_true', help='Extract and index all PDFs')
+    parser.add_argument('--search', type=str, help='Search query')
+    args = parser.parse_args()
+
+    if args.build:
+        build_index()
+    elif args.search:
+        for result in search(args.search):
+            print(f"\n📄 {result['file']} (Chunk {result['chunk_id']})\n{result['text']}\n{'-'*60}")
+    else:
+        print("Use --build to process PDFs or --search 'your query' to search the index.")
